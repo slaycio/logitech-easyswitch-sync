@@ -325,37 +325,39 @@ if (-not $psExe) { throw "Neither pwsh.exe nor powershell.exe was found on PATH.
 $scriptPath = Join-Path $InstallDir "watcher.ps1"
 $logPath    = Join-Path $InstallDir "watcher.log"
 $runnerPath = Join-Path $InstallDir "run.ps1"
+$vbsPath    = Join-Path $InstallDir "run.vbs"
 
 # A plain wrapper script, rather than threading the whole invocation through
-# -Command string quoting, keeps both the Scheduled Task action and the
-# Startup-folder fallback below simple (single quoted path each, no nested
-# quote escaping to get wrong twice).
+# -Command string quoting, keeps this simple (single quoted path, no nested
+# quote escaping to get wrong).
 $runnerContent = "& '$scriptPath' -KeyboardPath '$($kb.Path)' -MousePath '$($ms.Path)' -KeyboardChangeHostFeatureIndex $($kb.FeatureIndex) -MouseChangeHostFeatureIndex $($ms.FeatureIndex) *>> '$logPath'"
 Set-Content -Path $runnerPath -Value $runnerContent -Encoding UTF8
-$taskArgs = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runnerPath`""
+
+# `-WindowStyle Hidden` on pwsh/powershell itself is not reliable on Windows
+# 11 when Windows Terminal is the default terminal app - it can still show a
+# window and a taskbar entry, because the window is actually owned/hosted by
+# Windows Terminal rather than classic conhost. A .vbs launched via
+# WshShell.Run(cmd, 0, False) sets SW_HIDE at CreateProcess time, the same
+# trick the upstream input-switcher project uses, and never shows anything -
+# wscript.exe itself is a GUI-subsystem process with no window of its own.
+# Both the Scheduled Task and the Startup-folder fallback below go through
+# this same .vbs so neither can end up with a visible/taskbar window.
+$innerCmd = "`"$psExe`" -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runnerPath`""
+$vbsEscaped = $innerCmd -replace '"', '""'
+$vbsContent = "Set WshShell = CreateObject(`"WScript.Shell`")`r`nWshShell.Run `"$vbsEscaped`", 0, False`r`nSet WshShell = Nothing`r`n"
+Set-Content -Path $vbsPath -Value $vbsContent -Encoding ASCII
 
 function Install-StartupFolderFallback {
     # Some corporate security policies deny standard users Register-ScheduledTask
     # (HRESULT 0x80070005) even for their own per-user logon tasks. The Startup
     # folder is a much more universally-permitted mechanism - it's just a file
-    # drop, not a Task Scheduler API call - so fall back to it instead of
-    # leaving the user with no autostart at all. Uses a .vbs wrapper (same
-    # trick the upstream input-switcher project uses) so nothing flashes a
-    # console window at logon.
-    $startupDir = [Environment]::GetFolderPath('Startup')
-    $vbsPath    = Join-Path $startupDir "$TaskName.vbs"
-    # $taskArgs already contains its own quotes around $runnerPath - escape the
-    # *whole* Windows command line generically for VBS (every " doubled, then
-    # wrapped once) rather than hand-counting quote pairs, which is how the
-    # first version of this got the nesting wrong.
-    $winCommandLine = "`"$psExe`" $taskArgs"
-    $vbsEscaped = $winCommandLine -replace '"', '""'
-    $vbsContent = "Set WshShell = CreateObject(`"WScript.Shell`")`r`nWshShell.Run `"$vbsEscaped`", 0, False`r`nSet WshShell = Nothing`r`n"
-    Set-Content -Path $vbsPath -Value $vbsContent -Encoding ASCII
-    Write-Host "Installed a Startup-folder shortcut instead: $vbsPath" -ForegroundColor Yellow
+    # drop, not a Task Scheduler API call.
+    $startupDir  = [Environment]::GetFolderPath('Startup')
+    $startupVbs  = Join-Path $startupDir "$TaskName.vbs"
+    Copy-Item -Path $vbsPath -Destination $startupVbs -Force
+    Write-Host "Installed a Startup-folder shortcut instead: $startupVbs" -ForegroundColor Yellow
 
-    $wsh = New-Object -ComObject WScript.Shell
-    $wsh.Run("`"$psExe`" $taskArgs", 0, $false) | Out-Null
+    Start-Process -FilePath "wscript.exe" -ArgumentList "`"$startupVbs`""
 }
 
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
@@ -365,7 +367,7 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
 
 $usedFallback = $false
 try {
-    $action    = New-ScheduledTaskAction -Execute $psExe -Argument $taskArgs
+    $action    = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$vbsPath`""
     $trigger   = New-ScheduledTaskTrigger -AtLogOn
     $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
     $settings  = New-ScheduledTaskSettingsSet `
@@ -393,7 +395,7 @@ Write-Host ""
 Write-Host "Watcher is running in the background (hidden window)." -ForegroundColor Cyan
 Write-Host "Live log:    Get-Content '$logPath' -Wait -Tail 20" -ForegroundColor Cyan
 if ($usedFallback) {
-    Write-Host "Stop:        Get-Process pwsh,powershell -ErrorAction SilentlyContinue | Where-Object { `$_.Path -eq '$psExe' } | Stop-Process" -ForegroundColor Cyan
+    Write-Host "Stop:        Get-CimInstance Win32_Process -Filter `"Name='pwsh.exe' OR Name='powershell.exe'`" | Where-Object { `$_.CommandLine -match 'run\.ps1' } | ForEach-Object { Stop-Process -Id `$_.ProcessId -Force }" -ForegroundColor Cyan
 }
 else {
     Write-Host "Stop:        Stop-ScheduledTask -TaskName '$TaskName'" -ForegroundColor Cyan
