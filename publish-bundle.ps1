@@ -22,5 +22,5 @@ if (-not (Test-Path $dir)) {
     New-Item -ItemType Directory -Path $dir -Force | Out-Null
 }
 
-git bundle create $BundlePath --all
+git bundle create $BundlePath master
 Write-Host "Bundle updated: $BundlePath" -ForegroundColor Green
