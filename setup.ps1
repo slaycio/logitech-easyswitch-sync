@@ -44,7 +44,7 @@ function Stop-ExistingWatcherProcesses {
     # a previous install. Kill those explicitly so we never end up with two
     # watchers holding the keyboard handle at once.
     Get-CimInstance Win32_Process -Filter "Name='pwsh.exe' OR Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -match 'watcher\.ps1' } |
+        Where-Object { $_.CommandLine -match 'run\.ps1' } |
         ForEach-Object {
             Write-Host "Stopping existing watcher process (PID $($_.ProcessId))..." -ForegroundColor DarkGray
             Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
@@ -59,6 +59,11 @@ if ($Uninstall) {
     }
     else {
         Write-Host "Task '$TaskName' does not exist (already uninstalled?)." -ForegroundColor DarkGray
+    }
+    $startupVbs = Join-Path ([Environment]::GetFolderPath('Startup')) "$TaskName.vbs"
+    if (Test-Path $startupVbs) {
+        Remove-Item -Path $startupVbs -Force
+        Write-Host "Startup-folder shortcut removed." -ForegroundColor Green
     }
     Stop-ExistingWatcherProcesses
     if ($RemoveFiles -and (Test-Path $InstallDir)) {
@@ -319,33 +324,78 @@ if (-not $psExe) { throw "Neither pwsh.exe nor powershell.exe was found on PATH.
 
 $scriptPath = Join-Path $InstallDir "watcher.ps1"
 $logPath    = Join-Path $InstallDir "watcher.log"
-$innerCmd   = "& '$scriptPath' -KeyboardPath '$($kb.Path)' -MousePath '$($ms.Path)' -KeyboardChangeHostFeatureIndex $($kb.FeatureIndex) -MouseChangeHostFeatureIndex $($ms.FeatureIndex) *>> '$logPath'"
-$taskArgs   = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"$innerCmd`""
+$runnerPath = Join-Path $InstallDir "run.ps1"
+
+# A plain wrapper script, rather than threading the whole invocation through
+# -Command string quoting, keeps both the Scheduled Task action and the
+# Startup-folder fallback below simple (single quoted path each, no nested
+# quote escaping to get wrong twice).
+$runnerContent = "& '$scriptPath' -KeyboardPath '$($kb.Path)' -MousePath '$($ms.Path)' -KeyboardChangeHostFeatureIndex $($kb.FeatureIndex) -MouseChangeHostFeatureIndex $($ms.FeatureIndex) *>> '$logPath'"
+Set-Content -Path $runnerPath -Value $runnerContent -Encoding UTF8
+$taskArgs = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runnerPath`""
+
+function Install-StartupFolderFallback {
+    # Some corporate security policies deny standard users Register-ScheduledTask
+    # (HRESULT 0x80070005) even for their own per-user logon tasks. The Startup
+    # folder is a much more universally-permitted mechanism - it's just a file
+    # drop, not a Task Scheduler API call - so fall back to it instead of
+    # leaving the user with no autostart at all. Uses a .vbs wrapper (same
+    # trick the upstream input-switcher project uses) so nothing flashes a
+    # console window at logon.
+    $startupDir = [Environment]::GetFolderPath('Startup')
+    $vbsPath    = Join-Path $startupDir "$TaskName.vbs"
+    # $taskArgs already contains its own quotes around $runnerPath - escape the
+    # *whole* Windows command line generically for VBS (every " doubled, then
+    # wrapped once) rather than hand-counting quote pairs, which is how the
+    # first version of this got the nesting wrong.
+    $winCommandLine = "`"$psExe`" $taskArgs"
+    $vbsEscaped = $winCommandLine -replace '"', '""'
+    $vbsContent = "Set WshShell = CreateObject(`"WScript.Shell`")`r`nWshShell.Run `"$vbsEscaped`", 0, False`r`nSet WshShell = Nothing`r`n"
+    Set-Content -Path $vbsPath -Value $vbsContent -Encoding ASCII
+    Write-Host "Installed a Startup-folder shortcut instead: $vbsPath" -ForegroundColor Yellow
+
+    $wsh = New-Object -ComObject WScript.Shell
+    $wsh.Run("`"$psExe`" $taskArgs", 0, $false) | Out-Null
+}
 
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     Write-Host "Removing existing task '$TaskName' before re-registering..." -ForegroundColor DarkGray
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
 }
 
-$action    = New-ScheduledTaskAction -Execute $psExe -Argument $taskArgs
-$trigger   = New-ScheduledTaskTrigger -AtLogOn
-$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
-$settings  = New-ScheduledTaskSettingsSet `
-    -AllowStartIfOnBatteries `
-    -DontStopIfGoingOnBatteries `
-    -StartWhenAvailable `
-    -RestartCount 3 `
-    -RestartInterval (New-TimeSpan -Minutes 1) `
-    -ExecutionTimeLimit ([TimeSpan]::Zero)
+$usedFallback = $false
+try {
+    $action    = New-ScheduledTaskAction -Execute $psExe -Argument $taskArgs
+    $trigger   = New-ScheduledTaskTrigger -AtLogOn
+    $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+    $settings  = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable `
+        -RestartCount 3 `
+        -RestartInterval (New-TimeSpan -Minutes 1) `
+        -ExecutionTimeLimit ([TimeSpan]::Zero)
 
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-Write-Host "Scheduled task '$TaskName' registered (will also start at next logon)." -ForegroundColor Green
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+    Write-Host "Scheduled task '$TaskName' registered (will also start at next logon)." -ForegroundColor Green
+    Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+}
+catch {
+    Write-Host "Scheduled Task registration failed (often a security-policy restriction on this machine): $($_.Exception.Message)" -ForegroundColor Yellow
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    Install-StartupFolderFallback
+    $usedFallback = $true
+}
 
-Start-ScheduledTask -TaskName $TaskName
 Start-Sleep -Milliseconds 500
 
 Write-Host ""
 Write-Host "Watcher is running in the background (hidden window)." -ForegroundColor Cyan
 Write-Host "Live log:    Get-Content '$logPath' -Wait -Tail 20" -ForegroundColor Cyan
-Write-Host "Stop:        Stop-ScheduledTask -TaskName '$TaskName'" -ForegroundColor Cyan
+if ($usedFallback) {
+    Write-Host "Stop:        Get-Process pwsh,powershell -ErrorAction SilentlyContinue | Where-Object { `$_.Path -eq '$psExe' } | Stop-Process" -ForegroundColor Cyan
+}
+else {
+    Write-Host "Stop:        Stop-ScheduledTask -TaskName '$TaskName'" -ForegroundColor Cyan
+}
 Write-Host "Uninstall:   .\setup.ps1 -Uninstall" -ForegroundColor Cyan

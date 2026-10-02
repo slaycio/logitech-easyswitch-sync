@@ -70,6 +70,7 @@ Start-ScheduledTask -TaskName 'LogitechEasySwitchSync'
 - **Devices not found during setup**: make sure both are actively connected (not just paired) to the machine you're running `setup.ps1` on.
 - **Mouse stopped following after re-pairing**: HID device paths are tied to the Bluetooth link identity and can change if you unpair/re-pair. Just re-run `.\setup.ps1`.
 - **Nothing happens on switch**: check the log — if you see `"target unknown, skipping"`, the early notification wasn't caught for that switch; this hasn't recurred in testing but isn't architecturally guaranteed.
+- **`Register-ScheduledTask : Access denied`**: some corporate security policies block standard users from registering Scheduled Tasks entirely. `setup.ps1` detects this and automatically falls back to a `.vbs` shortcut in your per-user Startup folder instead (same effect, no Task Scheduler API involved) — you'll see a yellow "Installed a Startup-folder shortcut instead" message. `.\setup.ps1 -Uninstall` cleans up whichever one was actually used.
 
 ## Credits
 
