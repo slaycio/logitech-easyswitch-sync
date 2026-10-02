@@ -1,0 +1,7 @@
+# Runtime artifacts (installed copy lives under %LocalAppData%, not here, but just in case)
+*.log
+
+# OS/editor noise
+Thumbs.db
+.DS_Store
+.vscode/
